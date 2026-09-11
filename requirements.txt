@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+apscheduler
+yfinance
+pandas
+numpy
+plyer
+pytz
+lxml
+requests
