@@ -10,32 +10,53 @@ import pandas as pd
 import yfinance as yf
 
 PRICE_PERIOD = "18mo"  # enough history for 200-day MA + weekly wedge lookback
+BATCH_SIZE = 40          # tickers per yf.download() call
+BATCH_PAUSE_SECONDS = 1.5  # brief pause between batches so we don't burst Yahoo (or a small cloud instance) with hundreds of concurrent requests at once
 
 
 def fetch_price_history(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Bulk-download daily OHLCV for all tickers. Returns {ticker: DataFrame}."""
-    print(f"[data] Downloading price history for {len(tickers)} tickers...")
-    raw = yf.download(
-        tickers,
-        period=PRICE_PERIOD,
-        interval="1d",
-        group_by="ticker",
-        threads=True,
-        auto_adjust=False,
-        progress=False,
-    )
-
+    """
+    Bulk-download daily OHLCV for all tickers, in small batches rather than
+    one giant concurrent request. On a resource-constrained host (e.g. a
+    free-tier cloud instance), firing off requests for 500+ tickers at once
+    via yfinance's internal thread pool tends to hang or get rate-limited;
+    batching keeps peak concurrency low while still being reasonably fast.
+    """
     out = {}
-    for t in tickers:
+    total_batches = (len(tickers) + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"[data] Downloading price history for {len(tickers)} tickers in {total_batches} batches of {BATCH_SIZE}...")
+
+    for i in range(0, len(tickers), BATCH_SIZE):
+        batch = tickers[i:i + BATCH_SIZE]
+        batch_num = i // BATCH_SIZE + 1
         try:
-            df = raw[t].dropna(how="all")
-            if df.empty or len(df) < 60:
-                continue
-            df = df.rename(columns=str.lower)
-            out[t] = df
-        except Exception:
-            continue
-    print(f"[data] Got usable price history for {len(out)} tickers.")
+            raw = yf.download(
+                batch,
+                period=PRICE_PERIOD,
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                auto_adjust=False,
+                progress=False,
+                timeout=20,
+            )
+            for t in batch:
+                try:
+                    df = raw[t].dropna(how="all") if len(batch) > 1 else raw.dropna(how="all")
+                    if df.empty or len(df) < 60:
+                        continue
+                    df = df.rename(columns=str.lower)
+                    out[t] = df
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[data] Batch {batch_num}/{total_batches} failed entirely: {e}")
+
+        print(f"[data] price history batch {batch_num}/{total_batches} done -- {len(out)} usable so far")
+        if i + BATCH_SIZE < len(tickers):
+            time.sleep(BATCH_PAUSE_SECONDS)
+
+    print(f"[data] Got usable price history for {len(out)}/{len(tickers)} tickers.")
     return out
 
 

@@ -61,6 +61,7 @@ STATE = {
 }
 
 _lock = threading.Lock()
+_scan_in_progress = threading.Event()
 
 
 def is_market_open() -> bool:
@@ -88,6 +89,18 @@ def refresh_fundamentals_job():
 
 def refresh_scan_job():
     """Hourly job: pull fresh price history and re-run all screeners."""
+    if _scan_in_progress.is_set():
+        print("[main] Skipping scan -- a scan is already in progress (this prevents two overlapping "
+              "downloads from competing for resources, which can make both hang).")
+        return
+    _scan_in_progress.set()
+    try:
+        _run_scan()
+    finally:
+        _scan_in_progress.clear()
+
+
+def _run_scan():
     fundamentals = STATE["fundamentals"]
     if not fundamentals:
         print("[main] Skipping scan -- fundamentals not loaded yet.")
