@@ -6,8 +6,4 @@ pandas
 numpy
 plyer
 pytz
-lxml
-html5lib
-beautifulsoup4
 requests
-

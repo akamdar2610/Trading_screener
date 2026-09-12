@@ -99,10 +99,22 @@ data from whenever the instance last happened to be awake, not truly hourly.
 
 ## Notes and known limitations
 
-- **Data source is free Yahoo Finance data (yfinance).** It's unauthenticated
-  and occasionally rate-limits or has gaps — this is normal for free data, not
-  a bug. If a screener returns fewer results than expected, it's often a
-  missing fundamentals field for some tickers rather than an error.
+- **The universe (S&P 500 + Nasdaq 100 tickers) is a static snapshot**, not
+  scraped live from Wikipedia. We tried live-scraping and hit three different
+  failure modes across two rounds of fixes (a pandas API change, a missing
+  parser library, and Wikipedia removing the Nasdaq-100 constituent table
+  entirely) — since index membership only changes a few times a year, a
+  static list bundled in `tickers_data.py` is far more reliable than
+  re-scraping on every server start. **To refresh it** (recommended every
+  few months), pull an updated list from a source like
+  [stockanalysis.com/list/sp-500-stocks](https://stockanalysis.com/list/sp-500-stocks/)
+  and [stockanalysis.com/list/nasdaq-100-stocks](https://stockanalysis.com/list/nasdaq-100-stocks/)
+  and replace the two lists in `tickers_data.py`.
+- **Fundamentals data source is free Yahoo Finance data (yfinance).** It's
+  unauthenticated and occasionally rate-limits or has gaps — this is normal
+  for free data, not a bug. If a screener returns fewer results than
+  expected, it's often a missing fundamentals field for some tickers rather
+  than an error.
 - **Sector classification**: Yahoo classifies companies as "Technology",
   "Communication Services", etc. (GICS-style), not the "Electronic
   Technology" / "Technology Services" taxonomy from your original brief.
