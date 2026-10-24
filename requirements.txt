@@ -1,9 +1,9 @@
 fastapi
 uvicorn[standard]
 apscheduler
-yfinance
 pandas
 numpy
 plyer
 pytz
 requests
+curl_cffi

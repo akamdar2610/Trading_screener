@@ -8,3 +8,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: SEC_USER_AGENT
+        sync: false   # set in the Render dashboard, e.g.  Aayush Kamdar you@example.com  (SEC requires name + email)

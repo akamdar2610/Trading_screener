@@ -110,20 +110,35 @@ data from whenever the instance last happened to be awake, not truly hourly.
   [stockanalysis.com/list/sp-500-stocks](https://stockanalysis.com/list/sp-500-stocks/)
   and [stockanalysis.com/list/nasdaq-100-stocks](https://stockanalysis.com/list/nasdaq-100-stocks/)
   and replace the two lists in `tickers_data.py`.
-- **Fundamentals data source is free Yahoo Finance data (yfinance).** It's
-  unauthenticated and occasionally rate-limits or has gaps — this is normal
-  for free data, not a bug. If a screener returns fewer results than
-  expected, it's often a missing fundamentals field for some tickers rather
-  than an error.
-- **Sector classification**: Yahoo classifies companies as "Technology",
-  "Communication Services", etc. (GICS-style), not the "Electronic
-  Technology" / "Technology Services" taxonomy from your original brief.
-  The Strategy screener treats Yahoo's "Technology" sector as the closest
-  available proxy for both — good enough to narrow the list, not a precise
-  category match.
-- **EPS 5-year growth** uses whatever annual history yfinance's free income
-  statement exposes, which is typically ~4 years, not a true 5-year figure.
-  Treat it as a solid growth trend indicator rather than an exact number.
+- **Data sources (v2)** now come from the MIT-licensed
+  [day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill)
+  modules, vendored unmodified in `vendor/day_trader_skill/` (commit
+  `3d0f4ef6986f4984b7c6bd46f7ff4f87744c3abd`, see `SOURCE.txt` and `LICENSE`):
+  prices from Yahoo's v8 chart endpoint (`price_feed.py`, no cookie/crumb, with
+  a curl_cffi fallback), fundamentals + earnings from SEC EDGAR
+  (`edgar_feed.py`), news from Yahoo RSS + SEC 8-Ks (`news_feed.py`), NYSE
+  holiday/early-close clock (`market_clock.py`), and stop/target math via
+  `exit.compute` (`trade_plan.py`). yfinance is no longer used.
+- **You must set `SEC_USER_AGENT` on Render** (Environment tab), e.g.
+  `Aayush Kamdar you@example.com`. SEC requires a real name + email. Without
+  it, Invest / Strategy screeners and 8-K news stay empty (the dashboard shows
+  a banner saying so); price-only screeners (Breakout, Bounce) still work.
+- **NOT live-tested.** The build sandbox could not reach Yahoo or SEC, so the
+  parsers were tested on the skill's real recorded fixtures and on synthetic
+  data, but the first real run on Render is the true test. Check `/api/status`
+  -> `data_health` if a screener is empty.
+- **Fundamentals are approximations from SEC data**: market cap = SEC shares
+  outstanding x last close (ignores multi-class shares); ROE = latest annual
+  net income / year-end equity; EPS growth = CAGR of annual diluted EPS (up to
+  5 years; stock splits not adjusted, which can distort it); PEG is not
+  computed (that filter is skipped). IFRS filers/ADRs have no US-GAAP facts and
+  drop out of Invest and Strategy. Sector comes from the SEC SIC code mapped to
+  "Technology" (electronic technology + tech services), with a small fallback list.
+- **Earnings**: "next report" is an *estimate* (last filing + ~91 days), not a
+  confirmed date; ex-dividend dates are not available from these sources.
+- **Holiday calendar** covers 2026-2027 only (the dashboard warns after that).
+- **Trade plan columns** (stop = 10-day low minus 0.5 ATR, target = 2R, shares
+  for your dollar risk) are a starting point, not advice.
 - **Weekly wedge detection is a heuristic** (converging linear regression
   through swing highs/lows), not true pattern recognition. It's meant to
   narrow down candidates for you to visually confirm on a chart, per your

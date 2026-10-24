@@ -3,31 +3,29 @@ Trading Screener backend.
 
 Run with:  uvicorn main:app --reload --port 8000
 
-Endpoints (all GET unless noted):
-  /api/status
-  /api/screener/invest
-  /api/screener/breakout/confirmed
-  /api/screener/breakout/pre
-  /api/screener/bounce
-  /api/screener/strategy/pullback
-  /api/screener/strategy/wedge
-  /api/news
-  /api/earnings
-  /api/refresh   (POST) - triggers an immediate rescan in the background
+Data sources (all via the MIT-licensed day-trader-skill modules vendored in vendor/day_trader_skill):
+  prices        Yahoo v8 chart endpoint (no cookie/crumb)      -> price_feed.py
+  fundamentals  SEC EDGAR XBRL company facts (needs SEC_USER_AGENT) -> edgar_feed.py
+  news          Yahoo headline RSS + SEC 8-K filings           -> news_feed.py
+  market clock  NYSE holidays / early closes (2026-2027)       -> market_clock.py
+  stop / target exit.compute exact-cent planner                -> trade_plan.py
 """
 import datetime
 import os
 import threading
 
 import pytz
-import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+import edgar_feed
+import market_clock
+import news_feed
+import price_feed
 import screeners
-from data_fetch import fetch_price_history, fetch_fundamentals
+import trade_plan
 from notifier import notify_new_hits
 from universe import build_universe
 
@@ -36,7 +34,7 @@ NY_TZ = pytz.timezone("America/New_York")
 app = FastAPI(title="Trading Screener API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # local personal-use tool; tighten this if you ever expose it beyond localhost
+    allow_origins=["*"],  # personal-use tool; tighten if you expose it widely
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,54 +42,70 @@ app.add_middleware(
 STATE = {
     "last_scan": None,
     "last_fundamentals_refresh": None,
+    "universe": [],
     "universe_size": 0,
-    "results": {
-        "invest": [],
-        "breakout_confirmed": [],
-        "breakout_pre": [],
-        "bounce": [],
-        "strategy_pullback": [],
-        "strategy_wedge": [],
-    },
-    "fundamentals": {},
+    "results": {k: [] for k in ("invest", "breakout_confirmed", "breakout_pre", "bounce",
+                                "strategy_pullback", "strategy_wedge")},
+    "fundamentals": {},   # from SEC EDGAR
+    "earn_info": {},
+    "names": {},          # from Yahoo chart meta
     "price_data": {},
     "news": [],
+    "news_errors": [],
     "earnings": [],
     "status_message": "Starting up...",
 }
 
 _lock = threading.Lock()
 _scan_in_progress = threading.Event()
+_fund_in_progress = threading.Event()
+
+LABELS = {
+    "invest": "Invest", "breakout_confirmed": "Confirmed breakout", "breakout_pre": "Pre-breakout watchlist",
+    "bounce": "Bounce play", "strategy_pullback": "Strategy: pullback", "strategy_wedge": "Strategy: wedge reversal",
+}
 
 
 def is_market_open() -> bool:
-    now = datetime.datetime.now(NY_TZ)
-    if now.weekday() >= 5:
-        return False
-    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return open_t <= now <= close_t
+    return market_clock.is_open()
+
+
+def _meta():
+    """fundamentals + best-available company name for every ticker in the universe."""
+    meta = {}
+    for t in STATE["universe"]:
+        f = dict(STATE["fundamentals"].get(t, {}))
+        f["longName"] = STATE["names"].get(t) or f.get("longName") or t
+        meta[t] = f
+    return meta
 
 
 def refresh_fundamentals_job():
-    """Slow, once-a-day job: rebuild universe + pull fundamentals for all of it."""
-    with _lock:
-        STATE["status_message"] = "Refreshing universe & fundamentals..."
-    tickers = build_universe()
-    fundamentals = fetch_fundamentals(tickers)
-    with _lock:
-        STATE["fundamentals"] = fundamentals
-        STATE["universe_size"] = len(tickers)
-        STATE["last_fundamentals_refresh"] = datetime.datetime.now(NY_TZ).isoformat()
-        STATE["status_message"] = "Fundamentals refreshed."
-    print(f"[main] Fundamentals refreshed for {len(fundamentals)} tickers.")
+    """Slow daily job: SEC EDGAR fundamentals + earnings info. Scans work without it (only Invest / Strategy need it)."""
+    if _fund_in_progress.is_set():
+        return
+    _fund_in_progress.set()
+    try:
+        if not STATE["universe"]:
+            STATE["universe"] = build_universe()
+            STATE["universe_size"] = len(STATE["universe"])
+        with _lock:
+            STATE["status_message"] = "Refreshing fundamentals from SEC EDGAR..."
+        fund, earn = edgar_feed.fetch_all(STATE["universe"])
+        with _lock:
+            if fund:
+                STATE["fundamentals"], STATE["earn_info"] = fund, earn
+                STATE["last_fundamentals_refresh"] = datetime.datetime.now(NY_TZ).isoformat()
+            STATE["status_message"] = "Idle."
+        print(f"[main] Fundamentals refreshed for {len(fund)} tickers.")
+    finally:
+        _fund_in_progress.clear()
 
 
 def refresh_scan_job():
-    """Hourly job: pull fresh price history and re-run all screeners."""
+    """Pull fresh prices and re-run all screeners (skips if one is already running)."""
     if _scan_in_progress.is_set():
-        print("[main] Skipping scan -- a scan is already in progress (this prevents two overlapping "
-              "downloads from competing for resources, which can make both hang).")
+        print("[main] Skipping scan -- one is already in progress.")
         return
     _scan_in_progress.set()
     try:
@@ -101,102 +115,74 @@ def refresh_scan_job():
 
 
 def _run_scan():
-    fundamentals = STATE["fundamentals"]
-    if not fundamentals:
-        print("[main] Skipping scan -- fundamentals not loaded yet.")
-        return
-
-    tickers = list(fundamentals.keys())
+    if not STATE["universe"]:
+        STATE["universe"] = build_universe()
+        STATE["universe_size"] = len(STATE["universe"])
+    tickers = STATE["universe"]
     with _lock:
         STATE["status_message"] = "Scanning..."
-    price_data = fetch_price_history(tickers + ["SPY"])
+    price_data, names = price_feed.fetch_price_history(tickers + ["SPY"])
     spy_df = price_data.pop("SPY", None)
+    names.pop("SPY", None)
+    if not price_data:
+        with _lock:
+            STATE["status_message"] = "Price fetch failed for every ticker -- see /api/status data_health."
+        return
+
+    with _lock:
+        STATE["names"].update(names)
+    edgar_feed.finalize_market_cap(STATE["fundamentals"], price_data)
+    meta = _meta()
 
     results = {
-        "invest": screeners.screen_invest(price_data, fundamentals),
-        "breakout_confirmed": screeners.screen_breakout_confirmed(price_data, fundamentals, spy_df),
-        "breakout_pre": screeners.screen_breakout_pre(price_data, fundamentals),
-        "bounce": screeners.screen_bounce(price_data, fundamentals),
-        "strategy_pullback": screeners.screen_strategy_pullback(price_data, fundamentals),
-        "strategy_wedge": screeners.screen_strategy_wedge(price_data, fundamentals),
+        "invest": screeners.screen_invest(price_data, meta),
+        "breakout_confirmed": screeners.screen_breakout_confirmed(price_data, meta, spy_df),
+        "breakout_pre": screeners.screen_breakout_pre(price_data, meta),
+        "bounce": screeners.screen_bounce(price_data, meta),
+        "strategy_pullback": screeners.screen_strategy_pullback(price_data, meta),
+        "strategy_wedge": screeners.screen_strategy_wedge(price_data, meta),
     }
-
-    labels = {
-        "invest": "Invest",
-        "breakout_confirmed": "Confirmed breakout",
-        "breakout_pre": "Pre-breakout watchlist",
-        "bounce": "Bounce play",
-        "strategy_pullback": "Strategy: pullback",
-        "strategy_wedge": "Strategy: wedge reversal",
-    }
+    for rows in results.values():
+        trade_plan.add_plans(rows, price_data)
     for key, rows in results.items():
-        notify_new_hits(key, labels[key], rows)
+        notify_new_hits(key, LABELS[key], rows)
 
-    flagged_tickers = sorted({r["t"] for rows in results.values() for r in rows})
-    news = fetch_news(flagged_tickers[:15])
-    earnings = fetch_earnings_dividends(flagged_tickers)
+    flagged = sorted({r["t"] for rows in results.values() for r in rows})
+    watch = {t: meta[t]["longName"] for t in flagged[:25]}
+    try:
+        news_rows, news_errors = news_feed.collect(watch)
+    except Exception as e:
+        news_rows, news_errors = [], [f"news: {e}"]
+    earnings = build_earnings(flagged, price_data)
 
     with _lock:
         STATE["results"] = results
         STATE["price_data"] = price_data
-        STATE["news"] = news
+        STATE["news"], STATE["news_errors"] = news_rows, news_errors
         STATE["earnings"] = earnings
         STATE["last_scan"] = datetime.datetime.now(NY_TZ).isoformat()
         STATE["status_message"] = "Idle."
     print(f"[main] Scan complete. {sum(len(r) for r in results.values())} total hits across all screeners.")
 
 
-def fetch_news(tickers: list[str]) -> list[dict]:
-    items = []
-    seen_titles = set()
-    for t in tickers:
-        try:
-            for n in (yf.Ticker(t).news or [])[:3]:
-                title = n.get("title")
-                if not title or title in seen_titles:
-                    continue
-                seen_titles.add(title)
-                items.append({
-                    "h": title,
-                    "s": n.get("publisher", "Unknown"),
-                    "time": datetime.datetime.fromtimestamp(
-                        n.get("providerPublishTime", 0), tz=NY_TZ
-                    ).strftime("%b %d, %I:%M %p") if n.get("providerPublishTime") else "",
-                    "url": n.get("link", ""),
-                    "tickers": [t],
-                })
-        except Exception:
-            continue
-    items.sort(key=lambda x: x["time"], reverse=True)
-    return items[:20]
-
-
-def fetch_earnings_dividends(tickers: list[str]) -> list[dict]:
+def build_earnings(tickers, price_data):
+    """Last reported EPS (SEC) + ESTIMATED next report date + dividend yield from the latest annual dividend/share."""
     out = []
     for t in tickers:
-        try:
-            tk = yf.Ticker(t)
-            info = tk.info or {}
-            cal = tk.calendar or {}
-            next_earnings = None
-            if isinstance(cal, dict) and cal.get("Earnings Date"):
-                d = cal["Earnings Date"]
-                next_earnings = d[0].strftime("%b %d") if isinstance(d, list) and d else None
-            div_yield = info.get("dividendYield")
-            ex_div_ts = info.get("exDividendDate")
-            ex_div = (
-                datetime.datetime.fromtimestamp(ex_div_ts, tz=NY_TZ).strftime("%b %d")
-                if ex_div_ts else "—"
-            )
-            out.append({
-                "t": t,
-                "next": next_earnings or "—",
-                "est": info.get("epsForward") or info.get("forwardEps"),
-                "yield": f"{div_yield * 100:.1f}%" if div_yield else "—",
-                "exdiv": ex_div,
-            })
-        except Exception:
-            continue
+        e = STATE["earn_info"].get(t) or {}
+        f = STATE["fundamentals"].get(t) or {}
+        df = price_data.get(t)
+        px = float(df["close"].iloc[-1]) if df is not None else None
+        dps = f.get("divPerShare")
+        nxt = e.get("nextEst")
+        out.append({
+            "t": t,
+            "next": (datetime.date.fromisoformat(nxt).strftime("%b %d") + " (est.)") if nxt else "—",
+            "last_eps": e.get("lastEps"),
+            "last_eps_yoy": e.get("lastEpsYoy"),
+            "last_report": e.get("lastFiled") or "—",
+            "yield": f"{dps / px * 100:.1f}%" if (dps and px) else "—",
+        })
     return out
 
 
@@ -208,20 +194,31 @@ def startup():
     scheduler.start()
 
     def initial_load():
-        refresh_fundamentals_job()
-        refresh_scan_job()
+        refresh_scan_job()            # prices first so price-only screeners show up fast
+        refresh_fundamentals_job()    # then SEC fundamentals (minutes)
+        refresh_scan_job()            # rescan so Invest / Strategy see fundamentals
 
     threading.Thread(target=initial_load, daemon=True).start()
 
 
 @app.get("/api/status")
 def status():
+    m = market_clock.status()
     return {
         "last_scan": STATE["last_scan"],
         "last_fundamentals_refresh": STATE["last_fundamentals_refresh"],
         "universe_size": STATE["universe_size"],
-        "market_open": is_market_open(),
+        "market_open": m["open"],
+        "market": m,
         "status_message": STATE["status_message"],
+        "data_health": {
+            "prices_ok": price_feed.HEALTH["ok"], "prices_failed": price_feed.HEALTH["failed"],
+            "price_last_error": price_feed.HEALTH["last_error"],
+            "sec_user_agent_set": edgar_feed.STATUS["ua_ok"],
+            "fundamentals_loaded": len(STATE["fundamentals"]),
+            "edgar_last_error": edgar_feed.STATUS["last_error"],
+            "news_errors": STATE["news_errors"][:5],
+        },
     }
 
 

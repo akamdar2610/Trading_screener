@@ -119,6 +119,16 @@ const baseCols = [
   { key: "vol", label: "Volume", align: "right", mono: true, render: (r) => fmtVol(r.vol) },
 ];
 
+const planCols = (riskUsd) => [
+  { key: "stop", label: "Stop", align: "right", mono: true, render: (r) => (r.plan ? fmtUsd(r.plan.stop) : "—") },
+  { key: "target", label: "Target (2R)", align: "right", mono: true, render: (r) => (r.plan ? fmtUsd(r.plan.target) : "—") },
+  { key: "riskpct", label: "Risk %", align: "right", mono: true, render: (r) => (r.plan ? r.plan.risk_pct + "%" : "—") },
+  {
+    key: "shares", label: `Shares @ $${riskUsd}`, align: "right", mono: true,
+    render: (r) => (r.plan && r.px > r.plan.stop ? Math.floor(riskUsd / (r.px - r.plan.stop)) : "—"),
+  },
+];
+
 const SCREENERS = {
   invest: {
     label: "Invest",
@@ -242,6 +252,7 @@ export default function TradingDashboard() {
   const [variant, setVariant] = useState("main");
   const [quoteIdx, setQuoteIdx] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+  const [riskUsd, setRiskUsd] = useState(100);
 
   const active = SCREENERS[screener];
   const variantKeys = Object.keys(active.variants);
@@ -291,7 +302,10 @@ export default function TradingDashboard() {
             </h1>
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, color: C.textDim, fontSize: 13.5, flexWrap: "wrap" }}>
               <span style={{ width: 6, height: 6, borderRadius: "50%", background: statusData?.market_open ? C.gain : C.textFaint, display: "inline-block" }} />
-              <span>{statusData?.market_open ? "Market open, NYSE" : "Market closed"}</span>
+              <span>{statusData?.market_open ? "Market open, NYSE" : `Market closed (${statusData?.market?.reason || "—"})`}</span>
+              {statusData?.market && !statusData.market.calendar_known && (
+                <span style={{ color: C.loss, fontSize: 12.5 }}>· holiday calendar only covers 2026–2027</span>
+              )}
               {statusData?.last_scan && (
                 <span style={{ color: C.textFaint, fontFamily: fontMono, fontSize: 12.5 }}>
                   Last scan {new Date(statusData.last_scan).toLocaleTimeString()}
@@ -315,6 +329,21 @@ export default function TradingDashboard() {
             {refreshing ? "Refreshing..." : "Refresh now"}
           </button>
         </div>
+
+        {statusData && (() => {
+          const h = statusData.data_health || {};
+          const msgs = [];
+          if (!statusData.last_scan) msgs.push("First scan still running (a few minutes after a deploy or wake-up).");
+          if (statusData.last_scan && h.prices_ok === 0) msgs.push(`No prices loaded. Last error: ${h.price_last_error || "unknown"}`);
+          if (h.prices_failed > 0 && h.prices_ok > 0) msgs.push(`${h.prices_failed} tickers had no price data.`);
+          if (!h.sec_user_agent_set) msgs.push("SEC_USER_AGENT is not set on the server: fundamentals (Invest, Strategy) and 8-K news are disabled.");
+          else if (!h.fundamentals_loaded) msgs.push(`Fundamentals not loaded yet${h.edgar_last_error ? ": " + h.edgar_last_error : ""}.`);
+          return msgs.length ? (
+            <div style={{ border: `1px solid ${C.border}`, borderLeft: `3px solid ${C.loss}`, background: C.panel, borderRadius: 6, padding: "10px 16px", marginBottom: 18, fontSize: 13, color: C.textDim }}>
+              {msgs.map((m, i) => <div key={i}>{m}</div>)}
+            </div>
+          ) : null;
+        })()}
 
         {/* Quote band */}
         <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderLeft: `3px solid ${C.gold}`, borderRadius: 6, padding: "20px 24px", marginBottom: 28, display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 20 }}>
@@ -401,7 +430,12 @@ export default function TradingDashboard() {
                   {active.tagline} · {table.data ? `${table.data.length} matches` : "—"}
                 </p>
               </div>
-              <ScreenerTable columns={activeVariant.cols} rows={table.data} loading={table.loading} error={table.error} />
+              <p style={{ color: C.textFaint, fontSize: 12.5, margin: "0 0 10px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                Stop = recent 10-day low minus 0.5 ATR; target = 2R (planned with the day-trader-skill exit planner). A starting point, not advice. Risk per trade: $
+                <input type="number" min="1" value={riskUsd} onChange={(e) => setRiskUsd(Math.max(1, Number(e.target.value) || 1))}
+                  style={{ width: 80, background: C.panel, border: `1px solid ${C.border}`, color: C.text, borderRadius: 4, padding: "3px 6px", fontFamily: fontMono }} />
+              </p>
+              <ScreenerTable columns={[...activeVariant.cols, ...planCols(riskUsd)]} rows={table.data} loading={table.loading} error={table.error} />
             </div>
           </div>
         )}
@@ -421,7 +455,12 @@ export default function TradingDashboard() {
                     <h3 style={{ fontFamily: fontBody, fontWeight: 600, fontSize: 15, margin: 0, color: C.text }}>{n.h}</h3>
                     <span style={{ color: C.textFaint, fontSize: 12.5, whiteSpace: "nowrap", fontFamily: fontMono }}>{n.time}</span>
                   </div>
-                  <span style={{ color: C.textFaint, fontSize: 12.5 }}>{n.s}</span>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", marginTop: 4 }}>
+                    {n.important && <span style={{ color: C.gold, fontSize: 11.5, fontWeight: 600, border: `1px solid ${C.gold}`, borderRadius: 3, padding: "0 5px" }}>IMPORTANT</span>}
+                    {(n.tickers || []).map((t) => <span key={t} style={{ fontFamily: fontMono, fontSize: 11.5, color: C.text, background: C.panelRaised, borderRadius: 3, padding: "0 5px" }}>{t}</span>)}
+                    {(n.tags || []).map((t) => <span key={t} style={{ fontSize: 11.5, color: C.textDim }}>#{t}</span>)}
+                    <span style={{ color: C.textFaint, fontSize: 12.5 }}>{n.s}</span>
+                  </div>
                 </a>
               ))}
             </div>
@@ -430,7 +469,7 @@ export default function TradingDashboard() {
               <h2 style={{ fontFamily: fontDisplay, fontSize: 21, fontWeight: 500, margin: "0 0 6px", display: "flex", alignItems: "center", gap: 8 }}>
                 <CalendarClock size={18} style={{ color: C.gold }} /> Earnings & dividends
               </h2>
-              <p style={{ color: C.textDim, fontSize: 13, margin: "0 0 14px" }}>For tickers currently flagged across your screeners</p>
+              <p style={{ color: C.textDim, fontSize: 13, margin: "0 0 14px" }}>For tickers currently flagged across your screeners. Source: SEC filings. Next-report dates are estimates (last filing + ~91 days), not confirmed; ex-dividend dates are not available.</p>
               {earnings.loading && <EmptyState title="Loading..." detail="Fetching earnings and dividend data." />}
               {earnings.error && <EmptyState title="Can't reach the screener server" detail={`Make sure the backend is deployed and reachable.`} />}
               {!earnings.loading && !earnings.error && (!earnings.data || earnings.data.length === 0) && (
@@ -442,10 +481,10 @@ export default function TradingDashboard() {
                     <thead>
                       <tr>
                         <Th>Ticker</Th>
-                        <Th align="right">Next earnings</Th>
-                        <Th align="right">EPS est.</Th>
+                        <Th align="right">Next report (est.)</Th>
+                        <Th align="right">Last EPS</Th>
+                        <Th align="right">EPS YoY</Th>
                         <Th align="right">Div. yield</Th>
-                        <Th align="right">Ex-div</Th>
                       </tr>
                     </thead>
                     <tbody>
@@ -453,9 +492,9 @@ export default function TradingDashboard() {
                         <tr key={r.t}>
                           <Td strong>{r.t}</Td>
                           <Td align="right" mono>{r.next}</Td>
-                          <Td align="right" mono>{r.est != null ? Number(r.est).toFixed(2) : "—"}</Td>
+                          <Td align="right" mono>{r.last_eps != null ? Number(r.last_eps).toFixed(2) : "—"}</Td>
+                          <Td align="right" mono>{r.last_eps_yoy != null ? (r.last_eps_yoy > 0 ? "+" : "") + r.last_eps_yoy + "%" : "—"}</Td>
                           <Td align="right" mono>{r.yield}</Td>
-                          <Td align="right" mono>{r.exdiv}</Td>
                         </tr>
                       ))}
                     </tbody>
