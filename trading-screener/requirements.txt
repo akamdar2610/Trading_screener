@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+apscheduler
+pandas
+numpy
+plyer
+pytz
+requests
+curl_cffi
