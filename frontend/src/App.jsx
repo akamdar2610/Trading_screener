@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { TrendingUp, TrendingDown, Zap, ArrowUpCircle, Compass, Newspaper, LayoutGrid, CalendarClock, RefreshCw, AlertCircle } from "lucide-react";
+import { TrendingUp, TrendingDown, Zap, ArrowUpCircle, Compass, Newspaper, LayoutGrid, CalendarClock, RefreshCw, AlertCircle, Briefcase, PieChart, Lock } from "lucide-react";
 
 // Relative path: works via the Vite dev-server proxy locally, and via
 // same-origin requests once this is built and served by the FastAPI backend.
@@ -246,6 +246,153 @@ function useFetch(path, deps) {
   return { data, loading, error, reload: load };
 }
 
+
+// ---- Portfolio (IBKR Flex, read-only). Password lives only in this browser tab's sessionStorage.
+function usePortfolio(active) {
+  const [key, setKey] = useState(() => { try { return sessionStorage.getItem("pk") || ""; } catch { return ""; } });
+  const [state, setState] = useState({ loading: false, data: null, error: null, locked: !key });
+  const load = useCallback((k) => {
+    setState((s) => ({ ...s, loading: true }));
+    fetch(API_BASE + "/portfolio", { headers: { "X-Access-Key": k } })
+      .then(async (res) => {
+        if (res.status === 401 || res.status === 403) {
+          const j = await res.json().catch(() => ({}));
+          throw Object.assign(new Error(j.detail || "Locked"), { locked: res.status === 401, disabled: res.status === 403 });
+        }
+        return res.json();
+      })
+      .then((j) => setState({ loading: false, data: j, error: null, locked: false }))
+      .catch((e) => setState({ loading: false, data: null, error: e.message, locked: !!e.locked || !k, disabled: e.disabled }));
+  }, []);
+  useEffect(() => { if (active && key) load(key); }, [active, key, load]);
+  const unlock = (k) => { try { sessionStorage.setItem("pk", k); } catch {} setKey(k); if (!k) setState({ loading: false, data: null, error: null, locked: true }); };
+  const refresh = () => fetch(API_BASE + "/portfolio/refresh", { method: "POST", headers: { "X-Access-Key": key } }).then(() => setTimeout(() => load(key), 25000));
+  return { ...state, unlock, refresh, key };
+}
+
+function Gate({ pf }) {
+  const [pw, setPw] = useState("");
+  if (pf.disabled) return <EmptyState title="Portfolio is switched off" detail={pf.error} />;
+  return (
+    <div style={{ maxWidth: 380, margin: "40px auto", textAlign: "center" }}>
+      <Lock size={20} style={{ color: C.textFaint, marginBottom: 10 }} />
+      <p style={{ margin: "0 0 12px", fontSize: 14 }}>Your portfolio is private. Enter your password.</p>
+      <form onSubmit={(e) => { e.preventDefault(); pf.unlock(pw); }} style={{ display: "flex", gap: 8 }}>
+        <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} autoFocus
+          style={{ flex: 1, background: C.panel, border: `1px solid ${C.border}`, color: C.text, borderRadius: 5, padding: "8px 10px", fontFamily: fontBody }} />
+        <button type="submit" style={{ background: C.goldSoft, border: `1px solid ${C.gold}`, color: C.gold, borderRadius: 5, padding: "8px 14px", cursor: "pointer" }}>Unlock</button>
+      </form>
+      {pf.error && !pf.disabled && <p style={{ color: C.loss, fontSize: 13, marginTop: 10 }}>{pf.error}</p>}
+    </div>
+  );
+}
+
+const money = (v, base) => (v < 0 ? "-" : "") + "$" + Math.abs(Number(v)).toLocaleString(undefined, { maximumFractionDigits: 0 }) + (base ? " " + base : "");
+
+function PortfolioBody({ pf, view }) {
+  if (pf.locked || pf.disabled) return <Gate pf={pf} />;
+  if (pf.loading && !pf.data) return <EmptyState title="Loading portfolio..." detail="Fetching your latest IBKR report." />;
+  if (pf.error) return <EmptyState title="Couldn't load portfolio" detail={pf.error} />;
+  const p = pf.data?.portfolio;
+  if (!p) {
+    return <EmptyState title={pf.data?.configured ? "No portfolio loaded yet" : "IBKR isn't connected yet"}
+      detail={pf.data?.error || "The first load takes about a minute after the server starts. Press refresh in a minute."} />;
+  }
+  const refreshBtn = (
+    <button onClick={pf.refresh} style={{ background: "transparent", border: `1px solid ${C.border}`, color: C.textDim, borderRadius: 5, padding: "6px 12px", fontSize: 12.5, cursor: "pointer", display: "flex", gap: 6, alignItems: "center" }}>
+      <RefreshCw size={12} /> Re-pull from IBKR
+    </button>
+  );
+  const note = <p style={{ color: C.textFaint, fontSize: 12.5, margin: "0 0 14px" }}>IBKR report as of {p.as_of || "—"} (flex reports are end-of-day); stock prices refreshed from Yahoo at the last scan. Amounts in {p.base || "base currency"}.</p>;
+
+  if (view === "portfolio") {
+    const cols = [
+      { key: "symbol", label: "Symbol", strong: true },
+      { key: "name", label: "Name", render: (r) => (r.name || "").slice(0, 28) },
+      { key: "qty", label: "Qty", align: "right", mono: true },
+      { key: "avg_cost", label: "Avg cost", align: "right", mono: true, render: (r) => (r.avg_cost != null ? fmtUsd(r.avg_cost) : "—") },
+      { key: "last", label: "Last", align: "right", mono: true, render: (r) => fmtUsd(r.last) },
+      { key: "value", label: "Value", align: "right", mono: true, render: (r) => money(r.value) },
+      { key: "weight", label: "Weight", align: "right", mono: true, render: (r) => r.weight + "%" },
+      { key: "pnl", label: "P&L", align: "right", mono: true, render: (r) => <span style={{ color: r.pnl >= 0 ? C.gain : C.loss }}>{money(r.pnl)} ({r.pnl_pct ?? "—"}%)</span> },
+      { key: "stop", label: "Sugg. stop", align: "right", mono: true, render: (r) => (r.plan ? fmtUsd(r.plan.stop) : "—") },
+      { key: "screens", label: "On screeners", render: (r) => (r.screens && r.screens.length ? r.screens.join(", ") : "—") },
+    ];
+    return (
+      <div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <h2 style={{ fontFamily: fontDisplay, fontSize: 21, fontWeight: 500, margin: 0 }}>Positions · {p.positions.length}</h2>{refreshBtn}
+        </div>
+        {note}
+        <ScreenerTable columns={cols} rows={p.positions.map((r, i) => ({ ...r, t: r.symbol + i }))} />
+      </div>
+    );
+  }
+
+  // dashboard view
+  const tile = (label, value, sub, color) => (
+    <div style={{ flex: "1 1 190px", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: "14px 16px" }}>
+      <div style={{ color: C.textFaint, fontSize: 12.5 }}>{label}</div>
+      <div style={{ fontFamily: fontMono, fontSize: 22, marginTop: 4, color: color || C.text }}>{value}</div>
+      {sub && <div style={{ color: C.textDim, fontSize: 12.5, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+  const stocks = p.positions.filter((x) => x.type === "STK");
+  const winners = [...stocks].sort((a, b) => b.pnl - a.pnl).slice(0, 3);
+  const losers = [...stocks].sort((a, b) => a.pnl - b.pnl).slice(0, 3).filter((x) => x.pnl < 0);
+  const warnings = [];
+  p.positions.filter((x) => x.weight > 20).forEach((x) => warnings.push(`${x.symbol} is ${x.weight}% of your account (over 20%).`));
+  if (p.cash_pct < 5) warnings.push(`Cash is only ${p.cash_pct}% of the account.`);
+  stocks.filter((x) => x.plan && x.last < x.plan.stop).forEach((x) => warnings.push(`${x.symbol} is below its suggested stop ($${x.plan.stop}).`));
+  const top = p.positions.slice(0, 10);
+  const maxW = Math.max(...top.map((x) => x.weight), 1);
+  const list = (items) => items.map((x) => (
+    <div key={x.symbol} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.borderSoft}`, fontSize: 13.5 }}>
+      <span style={{ fontWeight: 600 }}>{x.symbol}</span>
+      <span style={{ fontFamily: fontMono, color: x.pnl >= 0 ? C.gain : C.loss }}>{money(x.pnl)} ({x.pnl_pct ?? "—"}%)</span>
+    </div>
+  ));
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <h2 style={{ fontFamily: fontDisplay, fontSize: 21, fontWeight: 500, margin: 0 }}>Portfolio dashboard</h2>{refreshBtn}
+      </div>
+      {note}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 20 }}>
+        {tile("Account value", money(p.total), p.base)}
+        {tile("Invested", money(p.invested), `${(100 - p.cash_pct).toFixed(1)}% of account`)}
+        {tile("Cash", money(p.cash), `${p.cash_pct}% of account`)}
+        {tile("Unrealized P&L", money(p.unrealized_pnl), p.unrealized_pct != null ? `${p.unrealized_pct}% on cost` : "", p.unrealized_pnl >= 0 ? C.gain : C.loss)}
+      </div>
+      {warnings.length > 0 && (
+        <div style={{ border: `1px solid ${C.border}`, borderLeft: `3px solid ${C.loss}`, background: C.panel, borderRadius: 6, padding: "10px 16px", marginBottom: 20, fontSize: 13, color: C.textDim }}>
+          {warnings.map((w, i) => <div key={i}>{w}</div>)}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+        <div style={{ flex: "1.5 1 380px" }}>
+          <h3 style={{ fontFamily: fontBody, fontSize: 14, fontWeight: 600, margin: "0 0 10px" }}>Largest positions (% of account)</h3>
+          {top.map((x) => (
+            <div key={x.symbol} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 7, fontSize: 13 }}>
+              <span style={{ width: 62, fontWeight: 600 }}>{x.symbol}</span>
+              <div style={{ flex: 1, background: C.panelRaised, borderRadius: 3, height: 10 }}>
+                <div style={{ width: `${(x.weight / maxW) * 100}%`, background: x.weight > 20 ? C.loss : C.gold, height: 10, borderRadius: 3 }} />
+              </div>
+              <span style={{ width: 48, textAlign: "right", fontFamily: fontMono, color: C.textDim }}>{x.weight}%</span>
+            </div>
+          ))}
+        </div>
+        <div style={{ flex: "1 1 260px" }}>
+          <h3 style={{ fontFamily: fontBody, fontSize: 14, fontWeight: 600, margin: "0 0 6px" }}>Biggest winners</h3>
+          {list(winners)}
+          <h3 style={{ fontFamily: fontBody, fontSize: 14, fontWeight: 600, margin: "18px 0 6px" }}>Biggest losers</h3>
+          {losers.length ? list(losers) : <div style={{ color: C.textFaint, fontSize: 13 }}>No losing positions.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function TradingDashboard() {
   const [tab, setTab] = useState("screener");
   const [screener, setScreener] = useState("invest");
@@ -258,6 +405,7 @@ export default function TradingDashboard() {
   const variantKeys = Object.keys(active.variants);
   const activeVariant = active.variants[variant] || active.variants[variantKeys[0]];
 
+  const pf = usePortfolio(tab === "portfolio" || tab === "dashboard");
   const status = useFetch("/status", []);
   const table = useFetch(activeVariant.endpoint, [activeVariant.endpoint]);
   const news = useFetch("/news", [tab]);
@@ -363,7 +511,7 @@ export default function TradingDashboard() {
 
         {/* Main nav */}
         <div style={{ display: "flex", justifyContent: "center", gap: 28, borderBottom: `1px solid ${C.border}`, marginBottom: 24 }}>
-          {[{ key: "screener", label: "Screener", Icon: LayoutGrid }, { key: "news", label: "News", Icon: Newspaper }].map(({ key, label, Icon }) => (
+          {[{ key: "screener", label: "Screener", Icon: LayoutGrid }, { key: "news", label: "News", Icon: Newspaper }, { key: "portfolio", label: "Portfolio", Icon: Briefcase }, { key: "dashboard", label: "Dashboard", Icon: PieChart }].map(({ key, label, Icon }) => (
             <button
               key={key}
               onClick={() => setTab(key)}
@@ -439,6 +587,8 @@ export default function TradingDashboard() {
             </div>
           </div>
         )}
+
+        {(tab === "portfolio" || tab === "dashboard") && <PortfolioBody pf={pf} view={tab} />}
 
         {tab === "news" && (
           <div style={{ display: "flex", gap: 28 }}>

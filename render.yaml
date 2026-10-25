@@ -10,3 +10,9 @@ services:
         value: 3.11.9
       - key: SEC_USER_AGENT
         sync: false   # set in the Render dashboard, e.g.  Aayush Kamdar you@example.com  (SEC requires name + email)
+      - key: IBKR_FLEX_TOKEN
+        sync: false
+      - key: IBKR_FLEX_QUERY_ID
+        sync: false
+      - key: PORTFOLIO_PASSWORD
+        sync: false

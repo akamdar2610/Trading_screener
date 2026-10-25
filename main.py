@@ -11,16 +11,18 @@ Data sources (all via the MIT-licensed day-trader-skill modules vendored in vend
   stop / target exit.compute exact-cent planner                -> trade_plan.py
 """
 import datetime
+import hmac
 import os
 import threading
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import edgar_feed
+import ibkr_feed
 import market_clock
 import news_feed
 import price_feed
@@ -54,6 +56,8 @@ STATE = {
     "news_errors": [],
     "earnings": [],
     "status_message": "Starting up...",
+    "portfolio": None,
+    "portfolio_error": None,
 }
 
 _lock = threading.Lock()
@@ -186,10 +190,74 @@ def build_earnings(tickers, price_data):
     return out
 
 
+
+# ------------------------------------------------------------------ portfolio (IBKR Flex, read-only)
+_portfolio_lock = threading.Event()
+
+
+def refresh_portfolio_job():
+    if not ibkr_feed.configured():
+        STATE["portfolio_error"] = "IBKR_FLEX_TOKEN / IBKR_FLEX_QUERY_ID not set on the server."
+        return
+    if _portfolio_lock.is_set():
+        return
+    _portfolio_lock.set()
+    try:
+        parsed = ibkr_feed.parse_statement(ibkr_feed.fetch_statement_xml())
+        syms = sorted({p["yahoo"] for p in parsed["positions"] if p["type"] == "STK"})
+        live, plans = {}, {}
+        for sym in syms:
+            df, _ = price_feed.fetch_one(sym)
+            if df is not None:
+                live[sym] = float(df["close"].iloc[-1])
+                plans[sym] = trade_plan.plan_for(df)
+        summary = ibkr_feed.summarize(parsed, live)
+        flagged = {}
+        for key, rows in STATE["results"].items():
+            for r in rows:
+                flagged.setdefault(r["t"], []).append(LABELS[key])
+        for p in summary["positions"]:
+            p["plan"] = plans.get(p["yahoo"])
+            p["screens"] = flagged.get(p["yahoo"].replace(".", "-"), [])
+        with _lock:
+            STATE["portfolio"] = summary
+            STATE["portfolio_error"] = None
+        ibkr_feed.STATUS.update(last_fetch=datetime.datetime.now(NY_TZ).isoformat(), last_error=None)
+        print(f"[ibkr] portfolio loaded: {len(summary['positions'])} positions")
+    except Exception as e:
+        STATE["portfolio_error"] = f"{type(e).__name__}: {e}"
+        ibkr_feed.STATUS["last_error"] = STATE["portfolio_error"]
+        print(f"[ibkr] failed: {STATE['portfolio_error']}")
+    finally:
+        _portfolio_lock.clear()
+
+
+def _require_key(key):
+    pw = os.environ.get("PORTFOLIO_PASSWORD")
+    if not pw:
+        raise HTTPException(403, "Portfolio is disabled: set PORTFOLIO_PASSWORD on the server.")
+    if not key or not hmac.compare_digest(key.encode(), pw.encode()):
+        raise HTTPException(401, "Wrong password.")
+
+
+@app.get("/api/portfolio")
+def get_portfolio(x_access_key: str = Header(None)):
+    _require_key(x_access_key)
+    return {"portfolio": STATE["portfolio"], "error": STATE["portfolio_error"], "configured": ibkr_feed.configured()}
+
+
+@app.post("/api/portfolio/refresh")
+def refresh_portfolio(x_access_key: str = Header(None)):
+    _require_key(x_access_key)
+    threading.Thread(target=refresh_portfolio_job, daemon=True).start()
+    return {"status": "refresh started"}
+
+
 @app.on_event("startup")
 def startup():
     scheduler = BackgroundScheduler(timezone=NY_TZ)
     scheduler.add_job(refresh_fundamentals_job, "cron", hour=6, minute=0)
+    scheduler.add_job(refresh_portfolio_job, "cron", hour="7,17", minute=15)
     scheduler.add_job(refresh_scan_job, "cron", day_of_week="mon-fri", hour="9-16", minute=30)
     scheduler.start()
 
@@ -197,6 +265,7 @@ def startup():
         refresh_scan_job()            # prices first so price-only screeners show up fast
         refresh_fundamentals_job()    # then SEC fundamentals (minutes)
         refresh_scan_job()            # rescan so Invest / Strategy see fundamentals
+        refresh_portfolio_job()
 
     threading.Thread(target=initial_load, daemon=True).start()
 

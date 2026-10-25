@@ -153,3 +153,20 @@ All the screener thresholds (market cap floors, RSI ranges, volume
 multipliers, etc.) live as constants at the top of `screeners.py` and inline
 in each `screen_*` function — edit them directly and restart the server to
 adjust the strictness of any screener.
+
+## IBKR Portfolio & Dashboard tabs (read-only)
+
+Uses IBKR's Flex Web Service: a read-only report token. It cannot place trades or move money.
+
+1. IBKR Client Portal -> Performance & Reports -> Flex Queries -> create an **Activity Flex Query**
+   with sections **Account Information**, **Open Positions** (select all fields) and **Cash Report**;
+   Format **XML**. Save and note the **Query ID**.
+2. Same page -> Flex Web Service Configuration -> generate a **token**.
+3. In Render -> Environment add `IBKR_FLEX_TOKEN`, `IBKR_FLEX_QUERY_ID`, and `PORTFOLIO_PASSWORD`
+   (any password you choose; the tabs ask for it, since the site URL is otherwise public).
+   Without `PORTFOLIO_PASSWORD` the portfolio endpoints stay disabled.
+
+Flex reports are end-of-day, so IBKR figures are as of the last completed report; stock prices are
+refreshed from Yahoo. Pulled at 7:15 and 17:15 NY time and on "Re-pull from IBKR". Positions in
+non-base currencies are converted with IBKR's own fx rate. Never paste the token into chat.
+Not live-tested against a real IBKR account (parser tested on synthetic XML in the documented shape).
